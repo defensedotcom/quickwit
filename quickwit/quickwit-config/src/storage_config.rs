@@ -91,6 +91,23 @@ pub enum StorageBackendFlavor {
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StorageConfigs(#[serde_as(as = "EnumMap")] Vec<StorageConfig>);
 
+/// Validates a named S3 backend name. The name is embedded in the URI scheme
+/// `s3+<name>://`, which downstream consumers (metrics/DataFusion) parse with
+/// `url::Url`. URL schemes are case-insensitive and limited to `[a-z0-9.+-]`,
+/// so names are restricted to lowercase ASCII letters, digits, and `-` to keep
+/// routing consistent across the storage and query paths.
+fn validate_named_s3_backend_name(name: &str) -> anyhow::Result<()> {
+    ensure!(!name.is_empty(), "named S3 backend name must not be empty");
+    for character in name.chars() {
+        ensure!(
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-',
+            "invalid named S3 backend name `{name}`: only lowercase ASCII letters, digits, and \
+             `-` are allowed (the name is used in the `s3+{name}://` URI scheme)"
+        );
+    }
+    Ok(())
+}
+
 impl StorageConfigs {
     pub fn new(storage_configs: Vec<StorageConfig>) -> Self {
         Self(storage_configs)
@@ -123,6 +140,13 @@ impl StorageConfigs {
                 left != right,
                 "{left:?} storage config is defined multiple times",
             );
+        }
+        for storage_config in self.0.iter() {
+            if let StorageConfig::S3(s3_storage_config) = storage_config {
+                for name in s3_storage_config.named.keys() {
+                    validate_named_s3_backend_name(name)?;
+                }
+            }
         }
         Ok(())
     }
@@ -965,6 +989,32 @@ mod tests {
             .as_s3_config();
         assert_eq!(projected.region.as_deref(), Some("minio"));
         assert!(projected.force_path_style_access);
+    }
+
+    #[test]
+    fn test_validate_named_s3_backend_name() {
+        // Valid: lowercase ASCII letters, digits, and `-`.
+        for valid in ["alt", "seaweedfs", "ovh-morocco", "s3alt", "minio-backend"] {
+            validate_named_s3_backend_name(valid).unwrap();
+        }
+        // Invalid: empty, underscore, uppercase, dot, other punctuation.
+        for invalid in ["", "prod_logs", "Prod", "a.b", "a/b", "a b"] {
+            validate_named_s3_backend_name(invalid).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn test_storage_configs_reject_url_incompatible_named_backend() {
+        let s3_storage_config_yaml = r#"
+            named:
+              prod_logs:
+                endpoint: https://logs.example.com
+        "#;
+        let s3_storage_config: S3StorageConfig =
+            serde_yaml::from_str(s3_storage_config_yaml).unwrap();
+        let storage_configs = StorageConfigs::new(vec![s3_storage_config.into()]);
+        let error = storage_configs.validate().unwrap_err().to_string();
+        assert!(error.contains("prod_logs"), "unexpected error: {error}");
     }
 
     #[test]

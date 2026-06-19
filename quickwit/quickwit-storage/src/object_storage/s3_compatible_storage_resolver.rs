@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
 use quickwit_common::uri::Uri;
 use quickwit_config::{S3StorageConfig, StorageBackend};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 
 use super::s3_compatible_storage::create_s3_client;
 use crate::{
@@ -43,8 +43,11 @@ pub struct S3CompatibleObjectStorageFactory {
     // end up being used, or if something like azure, gcs, or even local files, will be used
     // instead.
     s3_client: OnceCell<S3Client>,
-    // One cached S3Client per named backend. Built lazily on first use.
-    named_s3_clients: Mutex<HashMap<String, S3Client>>,
+    // One cached S3Client per named backend, each behind its own `OnceCell` so
+    // backends initialize independently. The `Mutex` is only ever held
+    // synchronously to look up / insert the per-name cell — never across the
+    // client-building await.
+    named_s3_clients: Mutex<HashMap<String, Arc<OnceCell<S3Client>>>>,
 }
 
 impl S3CompatibleObjectStorageFactory {
@@ -76,15 +79,17 @@ impl StorageFactory for S3CompatibleObjectStorageFactory {
                     ))
                 })?
                 .as_s3_config();
-            let mut clients = self.named_s3_clients.lock().await;
-            let client = if let Some(client) = clients.get(name) {
-                client.clone()
-            } else {
-                let client = create_s3_client(&named_config).await;
-                clients.insert(name.to_string(), client.clone());
-                client
+            let client_cell = {
+                let mut clients = self
+                    .named_s3_clients
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Arc::clone(clients.entry(name.to_string()).or_default())
             };
-            drop(clients);
+            let client = client_cell
+                .get_or_init(|| create_s3_client(&named_config))
+                .await
+                .clone();
             let storage =
                 S3CompatibleObjectStorage::from_uri_and_client(&named_config, uri, client).await?;
             return Ok(Arc::new(DebouncedStorage::new(storage)));
@@ -118,5 +123,54 @@ mod tests {
             parse_named_key(&Uri::for_test("s3+with-dash://bucket/key")),
             Some("with-dash")
         );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "ci-test"), ignore)]
+    async fn test_named_backends_cache_independently() {
+        use std::collections::BTreeMap;
+
+        use quickwit_config::NamedS3StorageConfig;
+
+        let mut named = BTreeMap::new();
+        for backend in ["alt", "other"] {
+            named.insert(
+                backend.to_string(),
+                NamedS3StorageConfig {
+                    endpoint: Some("http://localhost:4566".to_string()),
+                    region: Some("us-east-1".to_string()),
+                    force_path_style_access: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let storage_config = S3StorageConfig {
+            named,
+            ..Default::default()
+        };
+        let factory = S3CompatibleObjectStorageFactory::new(storage_config);
+
+        // Distinct named backends each resolve into their own cached cell.
+        factory
+            .resolve(&Uri::for_test("s3+alt://bucket/a"))
+            .await
+            .unwrap();
+        factory
+            .resolve(&Uri::for_test("s3+other://bucket/b"))
+            .await
+            .unwrap();
+        // Re-resolving a backend reuses the cached, initialized cell.
+        factory
+            .resolve(&Uri::for_test("s3+alt://bucket/c"))
+            .await
+            .unwrap();
+
+        let clients = factory
+            .named_s3_clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(clients.len(), 2);
+        assert!(clients.get("alt").unwrap().initialized());
+        assert!(clients.get("other").unwrap().initialized());
     }
 }
